@@ -151,7 +151,7 @@
                   "label": "检测",
                   "level": "link",
                   "actionType": "ajax",
-                  "api": "post:/k8s/k8s_gpt/cluster/${cluster_md}/run"
+                  "api": "post:/k8s/plugins/k8sgpt/cluster/${cluster_md}/run"
                 },
                 {
                   "type": "button",
@@ -167,7 +167,7 @@
                     "body": [
                       {
                         "type": "k8sGPT",
-                        "api": "/k8s/k8s_gpt/cluster/${cluster_md}/result"
+                        "api": "/k8s/plugins/k8sgpt/cluster/${cluster_md}/result"
                       }
                     ]
                   }

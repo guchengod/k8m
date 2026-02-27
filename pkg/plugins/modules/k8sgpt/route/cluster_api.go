@@ -12,6 +12,8 @@ func RegisterClusterRoutes(r chi.Router) {
 	ctrl := &admin.Controller{}
 	prefix := "/plugins/" + modules.PluginNameK8sGPT
 	r.Get(prefix+"/kind/{kind}/run", response.Adapter(ctrl.ResourceRunAnalysis))
+	r.Post(prefix+"/cluster/{cluster}/run", response.Adapter(ctrl.ClusterRunAnalysisMgm))
+	r.Get(prefix+"/cluster/{cluster}/result", response.Adapter(ctrl.GetClusterRunAnalysisResultMgm))
 
 	klog.V(6).Infof("注册k8sgpt插件集群路由(cluster)")
 }
