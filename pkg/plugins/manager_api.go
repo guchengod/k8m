@@ -49,9 +49,9 @@ func (m *Manager) RegisterAdminRoutes(r chi.Router) {
 
 	// 定时任务管理
 	r.Get("/plugin/cron/{name}", response.Adapter(m.ListPluginCrons))
-	r.Post("/plugin/cron/{name}/run_once", response.Adapter(m.RunPluginCronOnce))
+	r.Post("/plugin/cron/{name}/run_once/index/{index}", response.Adapter(m.RunPluginCronOnce))
 	// 统一开关接口（生效/关闭）
-	r.Post("/plugin/cron/name/{name}/spec/{spec}/enabled/{enabled}", response.Adapter(m.SetPluginCronEnabled))
+	r.Post("/plugin/cron/name/{name}/index/{index}/enabled/{enabled}", response.Adapter(m.SetPluginCronEnabled))
 
 }
 
@@ -77,12 +77,15 @@ func countMenusRecursive(menus []Menu) int {
 
 // ListPlugins 获取所有已注册插件的Meta与状态
 // 返回插件名称、标题、版本、描述及当前状态（中文）
+// 支持分页查询，通过 page 和 perPage 参数控制
 func (m *Manager) ListPlugins(c *response.Context) {
+
+	params := dao.BuildParams(c)
 
 	items := make([]PluginItemVO, 0, len(m.modules))
 	// 读取数据库中的配置状态
-	params := dao.BuildDefaultParams()
-	cfgs, _, _ := (&models.PluginConfig{}).List(params)
+	dbParams := dao.BuildDefaultParams()
+	cfgs, _, _ := (&models.PluginConfig{}).List(dbParams)
 	cfgVerMap := make(map[string]string, len(cfgs))
 	for _, cfg := range cfgs {
 		cfgVerMap[cfg.Name] = cfg.Version
@@ -119,7 +122,24 @@ func (m *Manager) ListPlugins(c *response.Context) {
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].Name < items[j].Name
 	})
-	amis.WriteJsonListWithTotal(c, int64(len(items)), items)
+
+	// 分页处理
+	total := int64(len(items))
+	start := (params.Page - 1) * params.PerPage
+	if start < 0 {
+		start = 0
+	}
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + params.PerPage
+	if end > len(items) {
+		end = len(items)
+	}
+	pagedItems := items[start:end]
+
+	klog.V(8).Infof("返回插件列表，第%d页，每页%d条，共%d条", params.Page, params.PerPage, len(pagedItems))
+	amis.WriteJsonListWithTotal(c, total, pagedItems)
 }
 
 // ListPluginMenus 获取所有已启用插件的菜单定义
@@ -502,6 +522,7 @@ func (m *Manager) UpgradePlugin(c *response.Context) {
 
 // CronItemVO 定时任务状态展示结构体
 type CronItemVO struct {
+	Index      int    `json:"index"`      // 索引位置，用于前端标识
 	Spec       string `json:"spec"`
 	Registered bool   `json:"registered"`
 	Running    bool   `json:"running"`
@@ -520,7 +541,7 @@ func (m *Manager) ListPluginCrons(c *response.Context) {
 		return
 	}
 	items := make([]CronItemVO, 0, len(mod.Crons))
-	for _, spec := range mod.Crons {
+	for i, spec := range mod.Crons {
 		entry, exists := m.getCronEntry(name, spec)
 		running := false
 		m.mu.RLock()
@@ -538,6 +559,7 @@ func (m *Manager) ListPluginCrons(c *response.Context) {
 			}
 		}
 		items = append(items, CronItemVO{
+			Index:      i,
 			Spec:       spec,
 			Registered: exists,
 			Running:    running,
@@ -598,18 +620,32 @@ func (m *Manager) EnablePluginCron(c *response.Context) {
 // RunPluginCronOnce 立即执行指定插件的一条定时任务一次
 func (m *Manager) RunPluginCronOnce(c *response.Context) {
 	name := c.Param("name")
-	spec := c.Query("spec")
-	if spec == "" {
-		var body struct {
-			Spec string `json:"spec"`
-		}
-		_ = c.ShouldBindJSON(&body)
-		spec = body.Spec
-	}
-	if spec == "" {
-		amis.WriteJsonError(c, fmt.Errorf("缺少参数: spec"))
+	indexStr := c.Param("index")
+	if name == "" || indexStr == "" {
+		amis.WriteJsonError(c, fmt.Errorf("缺少参数: name/index"))
 		return
 	}
+	// 解析索引
+	var index int
+	_, err := fmt.Sscanf(indexStr, "%d", &index)
+	if err != nil {
+		amis.WriteJsonError(c, fmt.Errorf("无效的索引: %s", indexStr))
+		return
+	}
+	// 根据索引从插件配置中获取 spec
+	m.mu.RLock()
+	mod, ok := m.modules[name]
+	m.mu.RUnlock()
+	if !ok {
+		amis.WriteJsonError(c, fmt.Errorf("插件未注册: %s", name))
+		return
+	}
+	if index < 0 || index >= len(mod.Crons) {
+		amis.WriteJsonError(c, fmt.Errorf("索引超出范围: %d", index))
+		return
+	}
+	spec := mod.Crons[index]
+
 	if err := m.RunCronOnce(name, spec); err != nil {
 		amis.WriteJsonError(c, err)
 		return
@@ -639,21 +675,37 @@ func (m *Manager) StopPluginCron(c *response.Context) {
 }
 
 // SetPluginCronEnabled 设置插件定时任务开关（生效/关闭）
-// 路径参数：name 插件名、spec cron 表达式、enabled true/false
+// 路径参数：name 插件名、index cron 任务索引、enabled true/false
 // 行为：enabled=true 则生效（注册并调度）；enabled=false 则关闭（移除调度）
 func (m *Manager) SetPluginCronEnabled(c *response.Context) {
 	name := c.Param("name")
-	spec := c.Param("spec")
+	indexStr := c.Param("index")
 	enabled := c.Param("enabled")
-	if name == "" || spec == "" || enabled == "" {
-		amis.WriteJsonError(c, fmt.Errorf("缺少参数: name/spec/enabled"))
+	if name == "" || indexStr == "" || enabled == "" {
+		amis.WriteJsonError(c, fmt.Errorf("缺少参数: name/index/enabled"))
 		return
 	}
-	spec, err := utils.UrlSafeBase64Decode(spec)
+	// 解析索引
+	var index int
+	_, err := fmt.Sscanf(indexStr, "%d", &index)
 	if err != nil {
-		amis.WriteJsonError(c, err)
+		amis.WriteJsonError(c, fmt.Errorf("无效的索引: %s", indexStr))
 		return
 	}
+	// 根据索引从插件配置中获取 spec
+	m.mu.RLock()
+	mod, ok := m.modules[name]
+	m.mu.RUnlock()
+	if !ok {
+		amis.WriteJsonError(c, fmt.Errorf("插件未注册: %s", name))
+		return
+	}
+	if index < 0 || index >= len(mod.Crons) {
+		amis.WriteJsonError(c, fmt.Errorf("索引超出范围: %d", index))
+		return
+	}
+	spec := mod.Crons[index]
+
 	if enabled == "true" || enabled == "1" || enabled == "yes" {
 		if err := m.EnsureCron(name, spec); err != nil {
 			amis.WriteJsonError(c, err)
